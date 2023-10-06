@@ -31,40 +31,64 @@ int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
 			pd->system->error("%s:%i Couldn't load font %s: %s", __FILE__, __LINE__, fontpath, err);
 
 		// Note: If you set an update callback in the kEventInit handler, the system assumes the game is pure C and doesn't run any Lua code in the game
+		pd->display->setRefreshRate(50.0f);
 		pd->system->setUpdateCallback(update, pd);
 	}
 	
 	return 0;
 }
 
+// ---------------------------------------------------------
+// .* Game Code *.
+// ---------------------------------------------------------
 
-#define TEXT_WIDTH 86
-#define TEXT_HEIGHT 16
+typedef enum {
+	tGround,
+	tWall,
+} TileType;
 
-int x = (400-TEXT_WIDTH)/2;
-int y = (240-TEXT_HEIGHT)/2;
-int dx = 1;
-int dy = 2;
+typedef struct {
+	int x, y;
+} Vec2i;
+
+#define WORLD_TILE_COUNT 8
+#define WORLD_TILE_PX 16
+static struct {
+	unsigned int frameCount;
+	Vec2i cameraPos;
+
+	TileType map[WORLD_TILE_COUNT][WORLD_TILE_COUNT];
+
+}g;
 
 static int update(void* userdata)
 {
 	PlaydateAPI* pd = userdata;
 	
-	pd->graphics->clear(kColorWhite);
+	pd->graphics->clear(kColorWhite); // TODO: remove clear 
 	pd->graphics->setFont(font);
-	pd->graphics->drawText("Hello World!", strlen("Hello World!"), kASCIIEncoding, x, y);
 
-	x += dx;
-	y += dy;
+	PDButtons buttonsCurrent, buttonsPushed, buttonsReleased;
+	pd->system->getButtonState(&buttonsCurrent, &buttonsPushed, &buttonsReleased);
 	
-	if ( x < 0 || x > LCD_COLUMNS - TEXT_WIDTH )
-		dx = -dx;
-	
-	if ( y < 0 || y > LCD_ROWS - TEXT_HEIGHT )
-		dy = -dy;
-        
-	pd->system->drawFPS(0,0);
+	if ((buttonsCurrent & kButtonLeft) == kButtonLeft) { g.cameraPos.x++; }
+	if ((buttonsCurrent & kButtonRight) == kButtonRight) { g.cameraPos.x--; }
+	if ((buttonsCurrent & kButtonUp) == kButtonUp) { g.cameraPos.y++; }
+	if ((buttonsCurrent & kButtonDown) == kButtonDown) { g.cameraPos.y--; }
 
+	for (int x = 0; x < WORLD_TILE_COUNT; x++) {
+		for (int y = 0; y < WORLD_TILE_COUNT; y++) {
+			pd->graphics->fillRect(
+				x * WORLD_TILE_PX + g.cameraPos.x, 
+				y * WORLD_TILE_PX + g.cameraPos.y, 
+				WORLD_TILE_PX, 
+				WORLD_TILE_PX, 
+				(x ^ y) % 2 );
+		}
+	}
+
+	pd->system->drawFPS(0, 0);
+	g.frameCount++;
 	return 1;
 }
 
