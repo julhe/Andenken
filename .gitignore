@@ -1,4 +1,6 @@
-/build
+/buildDevelopment
+/buildRelease
+/buildDebug
 /*.pdx
 /Source/pdex.dll
 /Source/pdex.elf

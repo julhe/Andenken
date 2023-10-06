@@ -38,3 +38,9 @@ endif()
 
 include(${SDK}/C_API/buildsupport/playdate_game.cmake)
 
+if(MSVC)
+  target_compile_options(${PLAYDATE_GAME_NAME} PRIVATE /W4 /WX)
+else()
+  target_compile_options(${PLAYDATE_GAME_NAME} PRIVATE -Wall -Wextra ) #-Wpedantic # 
+endif()
+
