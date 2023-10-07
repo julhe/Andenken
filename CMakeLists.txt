@@ -30,10 +30,17 @@ set(PLAYDATE_GAME_DEVICE InnoJam2023_Oct_DEVICE)
 
 project(${PLAYDATE_GAME_NAME} C ASM)
 
+
 if (TOOLCHAIN STREQUAL "armgcc")
-	add_executable(${PLAYDATE_GAME_DEVICE} src/main.c)
+	add_executable(${PLAYDATE_GAME_DEVICE} 
+	src/main.c
+	src/rxi-ini/ini.c
+)
 else()
-	add_library(${PLAYDATE_GAME_NAME} SHARED src/main.c )
+	add_library(${PLAYDATE_GAME_NAME} SHARED 
+	src/main.c 
+	src/rxi-ini/ini.c
+)
 endif()
 
 include(${SDK}/C_API/buildsupport/playdate_game.cmake)
@@ -41,6 +48,6 @@ include(${SDK}/C_API/buildsupport/playdate_game.cmake)
 if(MSVC)
   target_compile_options(${PLAYDATE_GAME_NAME} PRIVATE /W4 /WX)
 else()
-  target_compile_options(${PLAYDATE_GAME_NAME} PRIVATE -Wall -Wextra ) #-Wpedantic # 
+  #target_compile_options(${PLAYDATE_GAME_NAME} PRIVATE -Wall -Wextra ) #-Wpedantic # 
 endif()
 
