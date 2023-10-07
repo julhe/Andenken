@@ -92,6 +92,18 @@ static void LoadBitmapFromFile(PlaydateAPI* pd, LCDBitmap** bitmap, const char* 
 
 }
 
+LCDBitmap* ScaleBitmap(PlaydateAPI* pd, LCDBitmap* src, float scaleX, float scaleY) {
+	int width = 0, height = 0, rowbytes = 0;
+	uint8_t* mask = NULL;
+	uint8_t* data = NULL;
+	pd->graphics->getBitmapData(src, &width, &height, &rowbytes, &mask, &data);
+	LCDBitmap* newBitmap = pd->graphics->newBitmap((int)((float)width * scaleX), (int)((float)height * scaleY), kColorClear);
+	pd->graphics->pushContext(newBitmap);
+	pd->graphics->drawScaledBitmap(src, 0, 0, scaleX, scaleY);
+	pd->graphics->popContext();
+	
+	return newBitmap;
+}
 float Vec2Length(Vec2 v) {
 	return sqrtf(v.x * v.x + v.y * v.y);
 }
@@ -109,6 +121,9 @@ Vec2 Vec2Scale(Vec2 v, float s) {
 	return (Vec2){ v.x * s, v.y * s };
 }
 
+
+
+//NOTE-Julian: stolen from raylib!
 static char* LoadTextFile(PlaydateAPI* pd, const char* fileName) {
 	SDFile* file = pd->file->open(fileName, kFileRead);
 	char* text = NULL;
@@ -181,10 +196,31 @@ static LCDColor GetDithered(int x, int y, float value, LCDColor lowColor, LCDCol
 	return dither + value > 1.0f ? lowColor : highColor;
 }
 
+typedef enum {
+	udIsPlayer = 1,
+	udIsItem = 2,
+} SpriteUserData;
+
+#define ITEM_COUNT 5
+typedef enum {
+	ItemCasette,
+	ItemGameBoy,
+	ItemPuzzle,
+	ItemSandwich,
+	ItemTeddy,
+} ItemType;
+
+typedef struct {
+	LCDSprite* spriteWorld;
+	LCDSprite* spriteUi;
+	LCDBitmapTable* bitmap;
+	LCDBitmap* bitmapUi;
+	int collected;
+} Item;
 
 
-#define WORLD_TILE_COUNT 64
-#define WORLD_TILE_PX 32
+
+
 static struct {
 	unsigned int frameCount;
 	struct {
@@ -206,10 +242,60 @@ static struct {
 		float radius;
 		float radiusVel;
 	} light;
+
+	struct {
+		LCDBitmap* bgBitmap;
+		LCDSprite* bg;
+	} ui;
 	struct {
 		float crankToLightMult;
 	}config;
+
+	Item items[ITEM_COUNT];
 }g;
+
+void LoadAndInitializeItem(PlaydateAPI* pd, Item* item, int16_t index, float placementX, float placementY, const char* path) {
+	LoadBitmapTableFromFile(pd, &item->bitmap, path);
+	
+	// world
+	item->spriteWorld = pd->sprite->newSprite();
+	pd->sprite->addSprite(item->spriteWorld);
+	pd->sprite->setImage(item->spriteWorld, pd->graphics->getTableBitmap(item->bitmap, 0), kBitmapUnflipped);
+	pd->sprite->moveTo(item->spriteWorld, placementX, placementY);
+
+	// setup collision
+
+	pd->sprite->setCollideRect(item->spriteWorld, (PDRect) { .width = 64.0f, .height = 64.0f });
+	pd->sprite->collisionsEnabled(item->spriteWorld);
+
+	pd->sprite->setUserdata(item->spriteWorld, (void*) (size_t) (index + udIsItem));
+
+	// ui
+	// make downscaled version
+	item->bitmapUi = ScaleBitmap(pd, pd->graphics->getTableBitmap(item->bitmap, 0), 0.5f, 0.5f);
+	item->spriteUi = pd->sprite->newSprite();
+
+
+	pd->sprite->setImage(item->spriteUi, item->bitmapUi, kBitmapUnflipped);
+	pd->sprite->moveTo(item->spriteUi, 16.0f + 32.0f * (float)index, 16.0f);
+	pd->sprite->setIgnoresDrawOffset(item->spriteUi, 1);
+	pd->sprite->setZIndex(item->spriteUi, 1100);
+
+	//pd->sprite->addSprite(item->spriteUi);
+
+}
+
+void UpdateItem(PlaydateAPI* pd, Item* item) {
+	uint16_t animFrames = GetBitmapTableCount(item->bitmap);
+	pd->sprite->setImage(item->spriteWorld, pd->graphics->getTableBitmap(item->bitmap, (g.frameCount / 4) % animFrames), kBitmapUnflipped);
+
+}
+
+void SetItemCollected(PlaydateAPI* pd, Item* item) {
+	item->collected = 1;
+	pd->sprite->removeSprite(item->spriteWorld);
+	pd->sprite->addSprite(item->spriteUi);
+}
 
 static void reloadAssets(PlaydateAPI* pd) {
 	// load ini
@@ -222,6 +308,7 @@ static void reloadAssets(PlaydateAPI* pd) {
 	ini_free(config);
 	free(content);
 }
+
 
 static void init(PlaydateAPI* pd)
 {
@@ -258,6 +345,9 @@ static void init(PlaydateAPI* pd)
 	pd->sprite->setImage(g.Player.sprite, pd->graphics->getTableBitmap(g.bitmaps.player[0], 0), kBitmapUnflipped);
 	pd->sprite->addSprite(g.Player.sprite);
 	pd->sprite->moveTo(g.Player.sprite, 200.0f, 120.0f); //move to center of screen
+	pd->sprite->setCollideRect(g.Player.sprite, (PDRect) { .x = 16.0f, .width = 32.0f, .height = 64.0f });
+	//pd->sprite->collisionsEnabled(g.Player.sprite);
+	//pd->sprite->setUserdata(g.Player.sprite, (void*) (size_t) udIsPlayer);
 	
 
 	// setup light area 
@@ -268,13 +358,31 @@ static void init(PlaydateAPI* pd)
 	pd->sprite->addSprite(g.sprites.lightMask);
 	pd->sprite->moveTo(g.sprites.lightMask, 200.0f, 120.0f);
 	pd->sprite->setIgnoresDrawOffset(g.sprites.lightMask, 1);
-
+	pd->sprite->setZIndex(g.sprites.lightMask, 1000);
 	// load background
 	LoadBitmapTableFromFile(pd, &g.bitmaps.background, "backgroundTest.gif");
 	g.sprites.background = pd->sprite->newSprite();
 	pd->sprite->setImage(g.sprites.background, pd->graphics->getTableBitmap(g.bitmaps.background, 0), kBitmapUnflipped);
 	pd->sprite->addSprite(g.sprites.background);
 	pd->sprite->setZIndex(g.sprites.background, -16);
+
+
+	// Items
+	LoadAndInitializeItem(pd, &g.items[ItemCasette],	ItemCasette,	0200.0f, 0500.0f, "items/itemCasette.gif");
+	LoadAndInitializeItem(pd, &g.items[ItemGameBoy],	ItemGameBoy,	0600.0f, 0100.0f, "items/itemGameBoy.gif");
+	LoadAndInitializeItem(pd, &g.items[ItemPuzzle],		ItemPuzzle,		1200.0f, 0900.0f, "items/itemPuzzle.gif");
+	LoadAndInitializeItem(pd, &g.items[ItemSandwich],	ItemSandwich,	0000.0f, 0000.0f, "items/itemSandwich.gif");
+	LoadAndInitializeItem(pd, &g.items[ItemTeddy],		ItemTeddy,		0900.0f, 0500.0f, "items/itemTeddy.gif");
+
+	//UI background
+	const int uiBarHeught = 32;
+	g.ui.bgBitmap = pd->graphics->newBitmap(400, uiBarHeught, kColorBlack);
+	g.ui.bg = pd->sprite->newSprite();
+	pd->sprite->setImage(g.ui.bg, g.ui.bgBitmap, kBitmapUnflipped);
+	pd->sprite->addSprite(g.ui.bg);
+	pd->sprite->moveTo(g.ui.bg, 200, uiBarHeught * 0.5f);
+	pd->sprite->setIgnoresDrawOffset(g.ui.bg, 1);
+	pd->sprite->setZIndex(g.ui.bg, 1001);
 
 	reloadAssets(pd);
 }
@@ -332,7 +440,6 @@ static int update(void* userdata)
 		rawLightFill = max(32.0f / 240.0f, rawLightFill);
 		UpdateDampedSpringMotion(&g.light.radius, &g.light.radiusVel, rawLightFill, lightDamping);
 
-	
 		const float maxSize = 240.0f;
 		int lightAreaSize = (int)(g.light.radius * maxSize);
 
@@ -349,6 +456,32 @@ static int update(void* userdata)
 	{
 		uint16_t frameCount = GetBitmapTableCount(g.bitmaps.background);
 		pd->sprite->setImage(g.sprites.background, pd->graphics->getTableBitmap(g.bitmaps.background, (g.frameCount / 4) % frameCount), kBitmapUnflipped);
+	}
+
+	// Items Anim
+	// ---------------------------------------------------------
+	// check player item collisions
+
+	{
+		
+		float playerX, playerY;
+		pd->sprite->getPosition(g.Player.sprite, &playerX, &playerY);
+		float playerXnew, playerYnew;
+		int collisions = 0;
+		SpriteCollisionInfo* c = pd->sprite->checkCollisions(g.Player.sprite, playerX, playerY, &playerXnew, &playerYnew, &collisions);
+		if (collisions > 0) {
+			SpriteCollisionInfo ci = c[0];
+			size_t userData = (size_t) pd->sprite->getUserdata(ci.other);
+			size_t itemId = userData - udIsItem;
+			if (itemId < ITEM_COUNT) {
+				SetItemCollected(pd, &g.items[itemId]);
+			}
+		}
+
+		for (size_t i = 0; i < ITEM_COUNT; i++) {
+			UpdateItem(pd, &g.items[i]);
+		}
+
 	}
 
 	Vec2 cameraTarget = {0};
