@@ -12,6 +12,7 @@
 #include "pd_api.h"
 
 #include "rxi-ini\ini.h"
+#include "damped_spring.h"
 
 static int update(void* userdata);
 static void init(PlaydateAPI* userdata);
@@ -198,13 +199,16 @@ static struct {
 
 	struct {
 		LCDBitmapTable* player[9 /*8 directions + 1 idle*/];
-		LCDBitmap* lightMask;
-		LCDBitmap* backgroundTest;
+		LCDBitmap* light_base;
+		LCDBitmapTable* background;
 	}bitmaps;
 
 	struct {
-		float lightExp;
-		float lightRadius;
+		float radius;
+		float radiusVel;
+	} light;
+	struct {
+		float crankToLightMult;
 	}config;
 }g;
 
@@ -213,59 +217,11 @@ static void reloadAssets(PlaydateAPI* pd) {
 	char* content = LoadTextFile(pd, "config.ini");
 	ini_t* config = ini_load_from_memory(content);
 	// parse values
-//	char test = ini_get(config, "light", "exp");
-	g.config.lightExp = ini_get_float(config, "light", "exp");
-	g.config.lightRadius = ini_get_float(config, "light", "radius");
+	g.config.crankToLightMult = ini_get_float(config, "light", "crankToLightMult");
+	//g.config.lightRadius = ini_get_float(config, "light", "radius");
 	
 	ini_free(config);
 	free(content);
-	// generate light mask 
-	{
-		const int height = 240, width = 400;
-		pd->graphics->freeBitmap(g.bitmaps.lightMask);
-		g.bitmaps.lightMask = pd->graphics->newBitmap(width, height, kColorBlack);
-		pd->graphics->pushContext(g.bitmaps.lightMask);
-		//for (int x = 0; x < width; x++) {
-		//	for (int y = 0; y < height; y++)
-		//	{
-		//		float xf = (float)((x) - width / 2);
-		//		float yf = (float)((y) - height / 2);
-		//		float dist = sqrtf(xf * xf + yf * yf);
-		//		dist /= g.config.lightRadius;
-		//		dist = powf(dist, g.config.lightExp);
-		//		LCDColor color = GetDithered(x, y , dist, kColorClear, kColorBlack);
-		//		if (color != kColorClear) {
-		//			pd->graphics->drawLine(x, y, x, y, 1, kColorBlack);
-		//		}
-		//	}
-		//}
-		pd->graphics->setDrawMode(kDrawModeWhiteTransparent);
-		pd->graphics->fillEllipse(0, 0, height, height, 0.0f, 0.0f, kColorWhite);
-		pd->graphics->popContext();
-
-		pd->sprite->removeSprite(g.sprites.lightMask);
-		pd->sprite->freeSprite(g.sprites.lightMask);
-
-		g.sprites.lightMask = pd->sprite->newSprite();
-		pd->sprite->setImage(g.sprites.lightMask, g.bitmaps.lightMask, kBitmapUnflipped);
-		//pd->sprite->addSprite(g.sprites.lightMask);
-
-		const Vec2 screenCenter = {
-			pd->display->getWidth() / 2.0f,
-			pd->display->getHeight() / 2.0f
-		};
-		pd->sprite->moveTo(g.sprites.lightMask, screenCenter.x, screenCenter.y);		
-	}
-
-
-
-	LoadBitmapFromFile(pd, &g.bitmaps.backgroundTest, "GameJam_Background.png");
-	pd->sprite->removeSprite(g.sprites.background);
-	pd->sprite->freeSprite(g.sprites.background);
-	g.sprites.background = pd->sprite->newSprite();
-	pd->sprite->setImage(g.sprites.background, g.bitmaps.backgroundTest, kBitmapUnflipped);
-	pd->sprite->addSprite(g.sprites.background);
-	pd->sprite->setZIndex(g.sprites.background, -16);
 }
 
 static void init(PlaydateAPI* pd)
@@ -293,7 +249,6 @@ static void init(PlaydateAPI* pd)
 
 	// Initialize sprites
 	// ---------------------------------------------------------
-	LoadBitmapFromFile(pd, &g.bitmaps.backgroundTest, "GameJam_Background.png");
 	LoadBitmapTableFromFile(pd, &g.bitmaps.player[0], "player/runDownRight.gif");
 	LoadBitmapTableFromFile(pd, &g.bitmaps.player[1], "player/runDown.gif");
 	LoadBitmapTableFromFile(pd, &g.bitmaps.player[2], "player/runDownLeft.gif");
@@ -311,12 +266,21 @@ static void init(PlaydateAPI* pd)
 	pd->sprite->moveTo(g.Player.sprite, 200.0f, 120.0f);
 
 	// setup light area 
-	g.bitmaps.lightMask = pd->graphics->newBitmap(screenWidth, screenHeight, kColorBlack);
+	g.bitmaps.light_base = pd->graphics->newBitmap(screenWidth, screenHeight, kColorClear);
 	g.sprites.lightMask = pd->sprite->newSprite();
-	pd->sprite->setImage(g.sprites.lightMask, g.bitmaps.lightMask, kBitmapUnflipped);
+	pd->sprite->setImage(g.sprites.lightMask, g.bitmaps.light_base, kBitmapUnflipped);
+
+	pd->sprite->addSprite(g.sprites.lightMask);
+	pd->sprite->moveTo(g.sprites.lightMask, 200.0f, 120.0f);
+
+	// load background
+	LoadBitmapTableFromFile(pd, &g.bitmaps.background, "backgroundTest.gif");
+	g.sprites.background = pd->sprite->newSprite();
+	pd->sprite->setImage(g.sprites.background, pd->graphics->getTableBitmap(g.bitmaps.background, 0), kBitmapUnflipped);
+	pd->sprite->addSprite(g.sprites.background);
+	pd->sprite->setZIndex(g.sprites.background, -16);
 
 	reloadAssets(pd);
-
 }
 
 static int update(void* userdata)
@@ -325,10 +289,11 @@ static int update(void* userdata)
 #ifdef _WINDLL
 	reloadAssets(pd); //only hot reload during testing
 #endif
-	//const Vec2i screenCenter = {
-	//	pd->display->getWidth() / 2,
-	//	pd->display->getHeight() / 2
-	//};
+	//pd->graphics->setDrawOffset(0, 0);
+	////const Vec2i screenCenter = {
+	////	pd->display->getWidth() / 2,
+	////	pd->display->getHeight() / 2
+	////};
 
 
 	// Handle Input
@@ -372,77 +337,32 @@ static int update(void* userdata)
 	// Light
 	// ---------------------------------------------------------
 	{
-		pd->graphics->pushContext(g.bitmaps.lightMask);
-		float lightFill = 1.0f;
+		tDampedSpringMotionParams lightDamping = CalcDampedSpringMotionParams(1.0f / 50.0f, 0.25f, 1.0f);
+		float rawLightFill = fabsf( pd->system->getCrankChange() * 0.08f);
+		rawLightFill = max(32.0f / 240.0f, rawLightFill);
+		UpdateDampedSpringMotion(&g.light.radius, &g.light.radiusVel, rawLightFill, lightDamping);
+
+	
 		const float maxSize = 240.0f;
-		int lightAreaSize = (int)(lightFill * maxSize);
-		pd->graphics->setDrawMode(kDrawModeWhiteTransparent);
-		pd->graphics->setBackgroundColor(kColorBlack);
-		pd->graphics->fillEllipse(0, 0, lightAreaSize, lightAreaSize, 0.0f, 0.0f, kColorWhite);
+		int lightAreaSize = (int)(g.light.radius * maxSize);
+
+		int x = 200 - lightAreaSize / 2;
+		int y = 120 - lightAreaSize / 2;
+		pd->graphics->pushContext(g.bitmaps.light_base);
+			pd->graphics->clear(kColorBlack);
+			pd->graphics->fillEllipse(x, y, lightAreaSize, lightAreaSize, 0.0f, 0.0f, kColorClear);
 		pd->graphics->popContext();
+	}
+	// Background
+	{
+		uint16_t frameCount = GetBitmapTableCount(g.bitmaps.background);
+		pd->sprite->setImage(g.sprites.background, pd->graphics->getTableBitmap(g.bitmaps.background, (g.frameCount / 4) % frameCount), kBitmapUnflipped);
 	}
 
 	const Vec2 cameraTarget = g.Player.pos;
+	//pd->graphics->setDrawOffset((int) cameraTarget.x, (int) cameraTarget.y);
 	pd->sprite->moveTo(g.sprites.background, cameraTarget.x, cameraTarget.y);
-	// draw tiles
-	// ---------------------------------------------------------
-	
-	// TODO: flatten loop for extra perf?
-	//for (int x = 0; x < WORLD_TILE_COUNT; x++) {
-	//	for (int y = 0; y < WORLD_TILE_COUNT; y++) {
-	//		pd->graphics->fillRect(
-	//			x * WORLD_TILE_PX + cameraTarget.x,
-	//			y * WORLD_TILE_PX + cameraTarget.y,
-	//			WORLD_TILE_PX, 
-	//			WORLD_TILE_PX, 
-	//			(x ^ y) % 2 );
-	//	}
-	//}
-
-	// loop over entire screen
-	//for (int x = 0; x < pd->display->getWidth(); x++) {
-	//	for (int y = 0; y < pd->display->getHeight(); y++) {
-	//		//pd->graphics->p
-	//	}
-	//}
-
-	// draw player
-	//const int playerWidth = 14;
-	//const int playerHeight = 30;
-	//
-
-	//LCDBitmap* image = pd->graphics->newBitmap(32, 32, 0);
-
-	//pd->graphics->pushContext(image);
-	//	pd->graphics->fillEllipse(0, 0, playerWidth, playerHeight, 0.0f, 0.0f, kColorBlack);
-	//	pd->graphics->drawEllipse(0, 0, playerWidth, playerHeight, 1, 0.0f, 0.0f, kColorWhite);
-	//pd->graphics->popContext();
-	//LCDSprite* sprite = pd->sprite->newSprite();
-	//pd->sprite->setSize(sprite, 32, 32);
-	//pd->sprite->setImage(sprite, image, kBitmapUnflipped);
-	//pd->sprite->addSprite(sprite);
-	//pd->sprite->moveBy(sprite, 10, 14);
-	//
-
-
-	//pd->graphics->fillEllipse(screenCenter.x, screenCenter.y, 128, 128, 0.0f, 0.0f, kColorXOR);
-
-	//int gifFrameCount = pd->graphics
-	//uint16_t gifCount = GetBitmapTableCount(g.assets.gifTest);
-	//pd->graphics->drawBitmap(g.bitmaps.backgroundTest, g.Player.pos.x, g.Player.pos.y, kBitmapUnflipped);
-	//pd->graphics->drawBitmap(g.bitmaps.lightMask, 0, 0, kBitmapUnflipped);
-	//float scale = ((float) (g.frameCount % 40) / 40.0f);
-
-	//pd->sprite->setSize(g.sprites.lightMask, scale * 400.0f, scale * 240.0f);
-
-	
-	//pd->graphics->drawBitmap(pd->graphics->getTableBitmap(g.assets.gifTest, g.frameCount % gifCount), screenCenter.x, screenCenter.y, kBitmapUnflipped);
 	pd->sprite->updateAndDrawSprites();
-	//pd->graphics->setFont(font);
-//
-
-
-//	pd->graphics->drawText(value, strlen(value), kUTF8Encoding, 10, 10);
 
 
 	pd->system->drawFPS(0, 0);
