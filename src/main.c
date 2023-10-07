@@ -189,7 +189,6 @@ static struct {
 	unsigned int frameCount;
 	struct {
 		LCDSprite* sprite;
-		Vec2 pos;
 	}Player;
 	struct {
 		LCDSprite* lightMask;
@@ -237,16 +236,11 @@ static void init(PlaydateAPI* pd)
 			pd->system->error("%s:%i Couldn't load font %s: %s", __FILE__, __LINE__, fontpath, err);
 	}
 
-	//g.bitmaps.gifTest = LoadBitmapTableFromFile(pd, "Unbenannt-1.gif");
-	
+
 	pd->display->setRefreshRate(50.0f);
 
-	// Initialize sprites
-	// ---------------------------------------------------------
-	//g.sprites.background = pd->sprite->newSprite();
-	//pd->sprite->setImage(g.demoSprite, pd->graphics->getTableBitmap(g.bitmaps.gifTest, 0), kBitmapUnflipped);
-	//pd->sprite->addSprite(g.demoSprite);
 
+	g.light.radius = .1f;
 	// Initialize sprites
 	// ---------------------------------------------------------
 	LoadBitmapTableFromFile(pd, &g.bitmaps.player[0], "player/runDownRight.gif");
@@ -263,7 +257,8 @@ static void init(PlaydateAPI* pd)
 	g.Player.sprite = pd->sprite->newSprite();
 	pd->sprite->setImage(g.Player.sprite, pd->graphics->getTableBitmap(g.bitmaps.player[0], 0), kBitmapUnflipped);
 	pd->sprite->addSprite(g.Player.sprite);
-	pd->sprite->moveTo(g.Player.sprite, 200.0f, 120.0f);
+	pd->sprite->moveTo(g.Player.sprite, 200.0f, 120.0f); //move to center of screen
+	
 
 	// setup light area 
 	g.bitmaps.light_base = pd->graphics->newBitmap(screenWidth, screenHeight, kColorClear);
@@ -272,6 +267,7 @@ static void init(PlaydateAPI* pd)
 
 	pd->sprite->addSprite(g.sprites.lightMask);
 	pd->sprite->moveTo(g.sprites.lightMask, 200.0f, 120.0f);
+	pd->sprite->setIgnoresDrawOffset(g.sprites.lightMask, 1);
 
 	// load background
 	LoadBitmapTableFromFile(pd, &g.bitmaps.background, "backgroundTest.gif");
@@ -289,19 +285,13 @@ static int update(void* userdata)
 #ifdef _WINDLL
 	reloadAssets(pd); //only hot reload during testing
 #endif
-	//pd->graphics->setDrawOffset(0, 0);
-	////const Vec2i screenCenter = {
-	////	pd->display->getWidth() / 2,
-	////	pd->display->getHeight() / 2
-	////};
-
 
 	// Handle Input
 	// ---------------------------------------------------------
 	PDButtons buttonsCurrent, buttonsPushed, buttonsReleased;
 	pd->system->getButtonState(&buttonsCurrent, &buttonsPushed, &buttonsReleased);
 
-	// Player movement + 
+	// Player movement + animation
 	// ---------------------------------------------------------
 	{
 		Vec2 movement = { 0.0f, 0.0f };
@@ -310,6 +300,7 @@ static int update(void* userdata)
 		if ((buttonsCurrent & kButtonUp) == kButtonUp) { movement.y += 1.0f; }
 		if ((buttonsCurrent & kButtonDown) == kButtonDown) { movement.y -= 1.0f; }
 
+		// compute animation direction index
 		int directionMapedToAnimIndex = 3; // 3 == idle anim
 		if (movement.x != 0.0f || movement.y != 0.0f) {
 
@@ -319,6 +310,7 @@ static int update(void* userdata)
 			directionMapedToAnimIndex = min(8, directionMapedToAnimIndex);
 		}
 
+		// set animation frame and index
 		uint16_t animTableIndex = (uint16_t)directionMapedToAnimIndex;
 		uint16_t animTableCount = GetBitmapTableCount(g.bitmaps.player[animTableIndex]);
 		pd->sprite->setImage(
@@ -329,9 +321,7 @@ static int update(void* userdata)
 		movement = Vec2Normalized(movement);
 		const float movementSpeed = 4.0f;
 		movement = Vec2Scale(movement, movementSpeed);
-		g.Player.pos.x += movement.x;
-		g.Player.pos.y += movement.y;
-
+		pd->sprite->moveBy(g.Player.sprite, -movement.x, -movement.y);
 	}
 
 	// Light
@@ -349,21 +339,24 @@ static int update(void* userdata)
 		int x = 200 - lightAreaSize / 2;
 		int y = 120 - lightAreaSize / 2;
 		pd->graphics->pushContext(g.bitmaps.light_base);
+			pd->graphics->setDrawOffset(0, 0);
 			pd->graphics->clear(kColorBlack);
 			pd->graphics->fillEllipse(x, y, lightAreaSize, lightAreaSize, 0.0f, 0.0f, kColorClear);
 		pd->graphics->popContext();
 	}
-	// Background
+	// Background Anim
+	// ---------------------------------------------------------
 	{
 		uint16_t frameCount = GetBitmapTableCount(g.bitmaps.background);
 		pd->sprite->setImage(g.sprites.background, pd->graphics->getTableBitmap(g.bitmaps.background, (g.frameCount / 4) % frameCount), kBitmapUnflipped);
 	}
 
-	const Vec2 cameraTarget = g.Player.pos;
-	//pd->graphics->setDrawOffset((int) cameraTarget.x, (int) cameraTarget.y);
-	pd->sprite->moveTo(g.sprites.background, cameraTarget.x, cameraTarget.y);
+	Vec2 cameraTarget = {0};
+	pd->sprite->getPosition(g.Player.sprite, &cameraTarget.x, &cameraTarget.y);
+	cameraTarget.x -= 200.0f;
+	cameraTarget.y -= 120.0f;
+	pd->graphics->setDrawOffset((int) -cameraTarget.x, (int) -cameraTarget.y);
 	pd->sprite->updateAndDrawSprites();
-
 
 	pd->system->drawFPS(0, 0);
 	g.frameCount++;
