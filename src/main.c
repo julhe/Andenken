@@ -51,11 +51,6 @@ int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
 
 #define arrLen(staticArray) (sizeof(staticArray)/sizeof(staticArray[0]))
 
-typedef enum {
-	tGround,
-	tWall,
-} TileType;
-
 typedef struct {
 	int x, y;
 } Vec2i;
@@ -73,7 +68,7 @@ static uint16_t GetBitmapTableCount(LCDBitmapTable* table) {
 static void LoadBitmapTableFromFile(PlaydateAPI* pd, LCDBitmapTable** table, const char* path) {
 	const char* err;
 	*table = pd->graphics->loadBitmapTable(path, &err);
-	if (table == NULL)
+	if (*table == NULL)
 		pd->system->error("%s:%i Couldn't asset %s: %s", __FILE__, __LINE__, path, err);
 
 }
@@ -216,6 +211,45 @@ static LCDColor GetDithered(int x, int y, float value, LCDColor lowColor, LCDCol
 	dither = dither * 2.0f - 1.0f;
 	return dither + value > 1.0f ? lowColor : highColor;
 }
+// Gamestate defs
+// ---------------------------------------------------------
+typedef enum {
+	gsInGame,
+	gsShowCutscene,
+	gsStartGame,
+	gsRestart,
+	gsTitleExplain,
+} GameState;
+
+// Intro screen defs
+// ---------------------------------------------------------
+#define CUTSCENE_COUNT 9
+typedef enum {
+	csTitle,
+	csTitleExplain,
+	csTitleZoomIn,
+
+	csCasette,
+	csGameBoy,
+	csPuzzle,
+	csSandwich,
+	csTeddy,
+
+	csEnd,
+} CutsceneType;
+
+typedef struct {
+	LCDSprite* sprite;
+	LCDBitmapTable* anim;
+
+	GameState gameStateOnExit;
+	const char* text;
+	_Bool showTextBox;
+
+	_Bool loopable;
+} CutsceneDef;
+
+
 
 // Item defs
 // ---------------------------------------------------------
@@ -235,6 +269,7 @@ typedef struct {
 	LCDBitmapTable* bitmap;
 	LCDBitmap* bitmapUi;
 	int collected;
+	CutsceneType onCollect;
 } Item;
 
 // Enemy defs
@@ -252,18 +287,28 @@ typedef struct {
 	LCDSprite* sprite;
 } Enemy;
 
+
+
 // Game Context
 // ---------------------------------------------------------
 
 const float lightFullRadius = 240.0f;
+
 static struct {
 	unsigned int frameCount;
+	unsigned int frameCountSinceCutSceneStart;
+
+	GameState gameState;
 	struct {
 		LCDSprite* sprite;
 	}Player;
 
 	Item items[ITEM_COUNT];
 	Enemy enemies[8];
+	CutsceneDef cutScenes[CUTSCENE_COUNT];
+	CutsceneType activeCutScene;
+	const char* currentDialogue;
+	_Bool showDialogueBox;
 
 	LCDFont* font;
 	struct {
@@ -276,6 +321,7 @@ static struct {
 		LCDBitmapTable* player[9 /*8 directions + 1 idle*/];
 		LCDBitmapTable* enemies[ENEMY_TYPE_COUNT];
 		LCDBitmapTable* background;
+		LCDBitmap* dialogueBox;
 		LCDBitmap* lightMask;		
 	} bitmaps;
 
@@ -299,7 +345,7 @@ static struct {
 // Item functions
 // ---------------------------------------------------------
 void ResetItem(PlaydateAPI* pd, Item* item);
-void LoadAndInitializeItem(PlaydateAPI* pd, Item* item, int16_t index, float placementX, float placementY, const char* path) {
+void LoadAndInitializeItem(PlaydateAPI* pd, Item* item, int16_t index, float placementX, float placementY, const char* path, CutsceneType onCollect) {
 	LoadBitmapTableFromFile(pd, &item->bitmap, path);
 	// make downscaled version of sprite for UI
 	item->bitmapUi = ScaleBitmap(pd, pd->graphics->getTableBitmap(item->bitmap, 0), 0.5f, 0.5f);
@@ -323,6 +369,8 @@ void LoadAndInitializeItem(PlaydateAPI* pd, Item* item, int16_t index, float pla
 	// make sprite accessable 
 	pd->sprite->setUserdata(item->spriteWorld, (void*)item);
 
+	item->onCollect = onCollect;
+
 
 	ResetItem(pd, item);
 }
@@ -336,6 +384,11 @@ void SetItemCollected(PlaydateAPI* pd, Item* item) {
 	item->collected = 1;
 	pd->sprite->removeSprite(item->spriteWorld);
 	pd->sprite->addSprite(item->spriteUi);
+
+	g.gameState = gsShowCutscene;
+	g.activeCutScene = item->onCollect;
+
+	
 }
 
 void ResetItem(PlaydateAPI* pd, Item* item) {
@@ -364,9 +417,9 @@ void DisableEnemy(PlaydateAPI* pd, Enemy* em) {
 	pd->sprite->freeSprite(em->sprite);
 }
 
-void EnableEnemy(PlaydateAPI* pd, Enemy* em, EmemyType type) {
+void EnableEnemy(PlaydateAPI* pd, Enemy* em, EmemyType type, float x, float y) {
 	if (em->active) {
-		return; 
+		DisableEnemy(pd, em); // disable first if enabled.
 	}
 	em->active = 1;
 	em->type = type;
@@ -381,7 +434,7 @@ void EnableEnemy(PlaydateAPI* pd, Enemy* em, EmemyType type) {
 	pd->sprite->addSprite(em->sprite);
 	pd->sprite->setCollideRect(em->sprite, (PDRect) {.x = 16.0f, .width = 32.0f, .height = 64.0f });
 	pd->sprite->collisionsEnabled(em->sprite);
-
+	pd->sprite->moveTo(em->sprite, x, y);
 	pd->sprite->setUserdata(em->sprite, (void*) em);
 }
 
@@ -402,7 +455,8 @@ void UpdateEnemy(PlaydateAPI* pd, Enemy* em) {
 		float distToPlayer = Vec2Length(vecToPlayer);
 		Vec2 dirToPlayer = Vec2Normalize(vecToPlayer);
 		int inRadius = distToPlayer < (g.light.radius01 * lightFullRadius * 0.25f);
-		if (!inRadius) {
+		int tooFarAway = distToPlayer > 600.0f;
+		if (!inRadius && !tooFarAway) {
 			pd->sprite->moveBy(em->sprite, dirToPlayer.x, dirToPlayer.y);
 		}
 
@@ -419,10 +473,43 @@ void UpdateEnemy(PlaydateAPI* pd, Enemy* em) {
 
 }
 
-
-
 int IsEnemy(void* enemyPtr) {
 	return IsPtrInArray(enemyPtr, &g.enemies[0], &g.enemies[arrLen(g.enemies)]);
+}
+
+// Screen functions
+// ---------------------------------------------------------
+void InitCutScene(PlaydateAPI* pd, CutsceneDef* cs, const char* text, const char* animPath, _Bool showDialogueBox, GameState gameStateOnExit, _Bool loopable) {
+	cs->text = text;
+	LoadBitmapTableFromFile(pd, &cs->anim, animPath);
+	cs->sprite = pd->sprite->newSprite();
+	pd->sprite->setIgnoresDrawOffset(cs->sprite, 1);
+	pd->sprite->moveTo(cs->sprite, 200, 120);
+	pd->sprite->setZIndex(cs->sprite, 2500);
+	cs->showTextBox = showDialogueBox;
+
+	cs->gameStateOnExit = gameStateOnExit;
+	cs->loopable = loopable;
+}
+
+void SetCutSceneActiveState(PlaydateAPI* pd, CutsceneDef* cs, _Bool active) {
+	pd->sprite->removeSprite(cs->sprite);
+	if (active) {
+		g.currentDialogue = cs->text;
+		pd->sprite->addSprite(cs->sprite);
+		g.showDialogueBox = cs->showTextBox;
+	}
+}
+
+void UpdateCutScene(PlaydateAPI* pd, CutsceneDef* cs) {
+	uint16_t maxcount = GetBitmapTableCount(cs->anim);
+	LCDBitmap* currentFrame = pd->graphics->getTableBitmap(cs->anim, (g.frameCountSinceCutSceneStart / 4) % maxcount);
+	pd->sprite->setImage(cs->sprite, currentFrame, kBitmapUnflipped);
+}
+
+_Bool HasCutSceneFinished(CutsceneDef* cs) {
+	uint16_t maxcount = GetBitmapTableCount(cs->anim);
+	return (g.frameCountSinceCutSceneStart / 4) >= maxcount;
 }
 
 // Config reloading (obsolete?)
@@ -439,6 +526,19 @@ static void reloadAssets(PlaydateAPI* pd) {
 	free(content);
 }
 
+void resetGame(PlaydateAPI* pd) {
+	// YOU DED!
+	pd->sprite->moveTo(g.Player.sprite, 0.0f, 0.0f);
+
+	for (size_t i = 0; i < ITEM_COUNT; i++) {
+		ResetItem(pd, &g.items[i]);
+	}
+
+
+	EnableEnemy(pd, &g.enemies[0], etShear, -097.0f, +345.0f);
+	EnableEnemy(pd, &g.enemies[1], etShear, +562.0f, +354.0f);
+	EnableEnemy(pd, &g.enemies[2], etShear, -587.0f, +169.0f);
+}
 
 static void init(PlaydateAPI* pd)
 {
@@ -490,19 +590,34 @@ static void init(PlaydateAPI* pd)
 	pd->sprite->setIgnoresDrawOffset(g.sprites.lightMask, 1);
 	pd->sprite->setZIndex(g.sprites.lightMask, 1000);
 	// load background
-	LoadBitmapTableFromFile(pd, &g.bitmaps.background, "backgroundTest.gif");
+	LoadBitmapTableFromFile(pd, &g.bitmaps.background, "background.gif");
 	g.sprites.background = pd->sprite->newSprite();
 	pd->sprite->setImage(g.sprites.background, pd->graphics->getTableBitmap(g.bitmaps.background, 0), kBitmapUnflipped);
 	pd->sprite->addSprite(g.sprites.background);
 	pd->sprite->setZIndex(g.sprites.background, -16);
 
+	// load cutscenes
+	InitCutScene(pd, &g.cutScenes[csTitle], "SOME DAYS ARE WORSE THAN THE OTHERS.\nTODAY IS ESPECIALLY BAD\nYOUR BOSS YELLED AT YOU\nAND YOU STILL NEED TO FINSH THE BUDGET\nTABLE THIS IS THE 3RD TIME YOU THOUGHT ABOUT IT\nBUT JUST CAN'T GET YOURSELF TO MOVE.\nYOU CAN'T KEEP YOUR EYES OPEN AND\nYOUR HEAD SLOWLY FALLS ONTO THE TABLE", "screens/titleScreen.gif", 1, gsTitleExplain, 1);
+	InitCutScene(pd, &g.cutScenes[csTitleExplain], "MOVE WITH THE D PAD\nCONTROL THE LIGHT INTENSITY\n WITH THE CRANK\nMONSTERS ARE SCARED BY THE LIGHT\n\nFIND YOUR 5 SEVEN FAVORITE ITEMS\nFROM THE REAL WORLD TO WAKE UP", "screens/titleScreen.gif", 1, gsStartGame, 1);
+	InitCutScene(pd, &g.cutScenes[csTitleZoomIn], "", "screens/zoomIn.gif", 0, gsInGame, 0);
+
+	InitCutScene(pd, &g.cutScenes[csCasette],	"YOUR MOM ALWAYS PLAYED THIS CASETTE ON\nLONG CAR RIDES\n YOU CAN ALMOST\nSMELL THE FRESH MOUNTAIN AIR", "screens/transparent.gif", 1, gsInGame, 1);
+	InitCutScene(pd, &g.cutScenes[csGameBoy],	"YOUR OLD GAMEBOY, YOU HAD COUNTLESS\nHOURS OF FUN WITH 32 BIT", "screens/transparent.gif", 1, gsInGame, 1);
+	InitCutScene(pd, &g.cutScenes[csPuzzle],	"DOING PUZZLES IS ALWAYS CALMING\nYOUR MIND AFTER EXHAUSTING WORKDAYS", "screens/transparent.gif", 1, gsInGame, 1);
+	InitCutScene(pd, &g.cutScenes[csSandwich],	"THIS SANDWICH LOOKS JUST LIKE\nTHE ONES YOUR GRANDMA PREPARED FOR\nYOU WHEN YOU VISITED HER ON FRIDAYS", "screens/transparent.gif", 1, gsInGame, 1);
+	InitCutScene(pd, &g.cutScenes[csTeddy],		"LOOKING AT THIS TEDDY GIVES YOU\nA FUZZY FEELING\nYOU FELL ASLEEP\nWITH IT WHEN YOU WERE A KID", "screens/transparent.gif", 1, gsInGame, 1);
+
+	InitCutScene(pd, &g.cutScenes[csEnd],		"YOU FOUND ALL THE ITEMS THAT\nTIE YOU TO THE REAL WORLD.\nYOUR LAST TASK IS TO GO HOME\nIMMEDIATELY AFTER WAKING UP\n\nNO MORE OVERTIME", "screens/titleScreen.gif", 1, gsRestart, 1);
+																	 
+	// dialogue box
+	LoadBitmapFromFile(pd, &g.bitmaps.dialogueBox, "Andenken_Textbox.png");
 
 	// Items
-	LoadAndInitializeItem(pd, &g.items[itCasette],	itCasette,		0200.0f, 0500.0f, "items/itemCasette.gif");
-	LoadAndInitializeItem(pd, &g.items[itGameBoy],	itGameBoy,		0600.0f, 0100.0f, "items/itemGameBoy.gif");
-	LoadAndInitializeItem(pd, &g.items[itPuzzle],	itPuzzle,		1200.0f, 0900.0f, "items/itemPuzzle.gif");
-	LoadAndInitializeItem(pd, &g.items[itSandwich],	itSandwich,		0000.0f, 0000.0f, "items/itemSandwich.gif");
-	LoadAndInitializeItem(pd, &g.items[itTeddy],	itTeddy,		0900.0f, 0500.0f, "items/itemTeddy.gif");
+	LoadAndInitializeItem(pd, &g.items[itCasette],	itCasette,		-097.0f, +345.0f, "items/itemCasette.gif", csCasette);
+	LoadAndInitializeItem(pd, &g.items[itGameBoy],	itGameBoy,		+562.0f, +354.0f, "items/itemGameBoy.gif", csGameBoy);
+	LoadAndInitializeItem(pd, &g.items[itPuzzle],	itPuzzle,		-587.0f, +169.0f, "items/itemPuzzle.gif", csPuzzle);
+	LoadAndInitializeItem(pd, &g.items[itSandwich],	itSandwich,		+598.0f, -272.0f, "items/itemSandwich.gif", csSandwich);
+	LoadAndInitializeItem(pd, &g.items[itTeddy],	itTeddy,		-654.0f, -354.0f, "items/itemTeddy.gif", csTeddy);
 
 	//UI background
 	const int uiBarHeught = 32;
@@ -517,8 +632,13 @@ static void init(PlaydateAPI* pd)
 	//Enemy bitmaps
 	LoadBitmapTableFromFile(pd, &g.bitmaps.enemies[etShear], "enemies/enemyShear.gif");
 
-	EnableEnemy(pd, &g.enemies[0], etShear);
 	reloadAssets(pd);
+
+	g.gameState = gsShowCutscene;
+	g.activeCutScene = csTitle;
+
+
+	resetGame(pd);
 }
 
 static int update(void* userdata)
@@ -528,129 +648,209 @@ static int update(void* userdata)
 	reloadAssets(pd); //only hot reload during testing
 #endif
 
-	// Handle Input
+	// Get Input
 	// ---------------------------------------------------------
 	PDButtons buttonsCurrent, buttonsPushed, buttonsReleased;
 	pd->system->getButtonState(&buttonsCurrent, &buttonsPushed, &buttonsReleased);
 
-	// Player movement + animation
-	// ---------------------------------------------------------
-	{
-		Vec2 movement = { 0.0f, 0.0f };
-		if ((buttonsCurrent & kButtonLeft) == kButtonLeft) { movement.x += 1.0f; }
-		if ((buttonsCurrent & kButtonRight) == kButtonRight) { movement.x -= 1.0f; }
-		if ((buttonsCurrent & kButtonUp) == kButtonUp) { movement.y += 1.0f; }
-		if ((buttonsCurrent & kButtonDown) == kButtonDown) { movement.y -= 1.0f; }
+	switch (g.gameState) {
+	case gsRestart: {
+		g.activeCutScene = csTitle;
+		g.gameState = gsShowCutscene;
+		resetGame(pd);
+		break;
+	}
 
-		// compute animation direction index
-		int directionMapedToAnimIndex = 3; // 3 == idle anim
-		if (movement.x != 0.0f || movement.y != 0.0f) {
+	case gsTitleExplain: {
+		g.activeCutScene = csTitleExplain;
+		g.gameState = gsShowCutscene;
+		break;
+	}
 
-			float directionNormalized = atan2f(movement.y, movement.x) / PI; // / PI -> map from [-pi/2..pi/2] to [-1..1] //TODO: atan2 is not the best in case of perf...
-			float directionMapedToAnimIndexF = (directionNormalized * 0.5f + 0.5f) * 8.0f; // map from [-1..1] to [0..1]
-			directionMapedToAnimIndex = max(0, (int)directionMapedToAnimIndexF);
-			directionMapedToAnimIndex = min(8, directionMapedToAnimIndex);
+	case gsStartGame: {
+		g.activeCutScene = csTitleZoomIn;
+		// fall trough
+	}
+	case gsShowCutscene: {
+		CutsceneDef* cs = &g.cutScenes[g.activeCutScene];
+		for (size_t i = 0; i < arrLen(g.cutScenes); i++) {
+			SetCutSceneActiveState(pd, &g.cutScenes[i], i == g.activeCutScene);
+			UpdateCutScene(pd, &g.cutScenes[i]);
 		}
 
-		// set animation frame and index
-		uint16_t animTableIndex = (uint16_t)directionMapedToAnimIndex;
-		uint16_t animTableCount = GetBitmapTableCount(g.bitmaps.player[animTableIndex]);
-		pd->sprite->setImage(
-			g.Player.sprite,
-			pd->graphics->getTableBitmap(g.bitmaps.player[animTableIndex], (g.frameCount / 4) % animTableCount),
-			kBitmapUnflipped);
+		_Bool aPressed = (buttonsPushed & kButtonA) == kButtonA;
+		_Bool cutSceneFinished = HasCutSceneFinished(cs);
 
-		movement = Vec2Normalize(movement);
-		const float movementSpeed = 4.0f;
-		movement = Vec2Scale(movement, movementSpeed);
-		pd->sprite->moveBy(g.Player.sprite, -movement.x, -movement.y);
+		if (cs->loopable && aPressed || !cs->loopable && cutSceneFinished) {
+			g.gameState = g.cutScenes[g.activeCutScene].gameStateOnExit;
+			g.frameCountSinceCutSceneStart = 0;
+			for (size_t i = 0; i < arrLen(g.cutScenes); i++) {
+				SetCutSceneActiveState(pd, &g.cutScenes[i], 0);
+				UpdateCutScene(pd, &g.cutScenes[i]);
+			}
+		}
+		else {
+
+			for (size_t i = 0; i < arrLen(g.cutScenes); i++) {
+				SetCutSceneActiveState(pd, &g.cutScenes[i], i == g.activeCutScene);
+				UpdateCutScene(pd, &g.cutScenes[i]);
+			}
+		}
+
+		break;
 	}
+	case gsInGame: {
+		g.currentDialogue = NULL;
+		g.showDialogueBox = 0;
+		// Player movement + animation
+		// ---------------------------------------------------------
+		{
+			Vec2 movement = { 0.0f, 0.0f };
+			if ((buttonsCurrent & kButtonLeft) == kButtonLeft) { movement.x += 1.0f; }
+			if ((buttonsCurrent & kButtonRight) == kButtonRight) { movement.x -= 1.0f; }
+			if ((buttonsCurrent & kButtonUp) == kButtonUp) { movement.y += 1.0f; }
+			if ((buttonsCurrent & kButtonDown) == kButtonDown) { movement.y -= 1.0f; }
 
-	// Light
-	// ---------------------------------------------------------
-	{
-		tDampedSpringMotionParams lightDamping = CalcDampedSpringMotionParams(1.0f / 50.0f, 0.25f, 1.0f);
-		float rawLightFill = fabsf( pd->system->getCrankChange() * 0.08f);
-		rawLightFill = max(32.0f / lightFullRadius, rawLightFill);
-		UpdateDampedSpringMotion(&g.light.radius01, &g.light.radiusVel, rawLightFill, lightDamping);
+			// compute animation direction index
+			int directionMapedToAnimIndex = 3; // 3 == idle anim
+			if (movement.x != 0.0f || movement.y != 0.0f) {
 
-		int lightAreaSize = (int)(g.light.radius01 * lightFullRadius);
+				float directionNormalized = atan2f(movement.y, movement.x) / PI; // / PI -> map from [-pi/2..pi/2] to [-1..1] //TODO: atan2 is not the best in case of perf...
+				float directionMapedToAnimIndexF = (directionNormalized * 0.5f + 0.5f) * 8.0f; // map from [-1..1] to [0..1]
+				directionMapedToAnimIndex = max(0, (int)directionMapedToAnimIndexF);
+				directionMapedToAnimIndex = min(8, directionMapedToAnimIndex);
+			}
 
-		int x = 200 - lightAreaSize / 2;
-		int y = 120 - lightAreaSize / 2;
-		pd->graphics->pushContext(g.bitmaps.lightMask);
-			pd->graphics->setDrawOffset(0, 0);
-			pd->graphics->clear(kColorBlack);
-			pd->graphics->fillEllipse(x, y, lightAreaSize, lightAreaSize, 0.0f, 0.0f, kColorClear);
-		pd->graphics->popContext();
-	}
-	// Background Anim
-	// ---------------------------------------------------------
-	{
-		uint16_t frameCount = GetBitmapTableCount(g.bitmaps.background);
-		pd->sprite->setImage(g.sprites.background, pd->graphics->getTableBitmap(g.bitmaps.background, (g.frameCount / 4) % frameCount), kBitmapUnflipped);
-	}
+			// set animation frame and index
+			uint16_t animTableIndex = (uint16_t)directionMapedToAnimIndex;
+			uint16_t animTableCount = GetBitmapTableCount(g.bitmaps.player[animTableIndex]);
+			pd->sprite->setImage(
+				g.Player.sprite,
+				pd->graphics->getTableBitmap(g.bitmaps.player[animTableIndex], (g.frameCount / 4) % animTableCount),
+				kBitmapUnflipped);
 
-	// Items Anim
-	// ---------------------------------------------------------
-	// check player item collisions
-	{
-		Vec2 player;
-		pd->sprite->getPosition(g.Player.sprite, &player.x, &player.y);
-		Vec2 playerNew;
-		int collisions = 0;
-		SpriteCollisionInfo* c = pd->sprite->checkCollisions(g.Player.sprite, player.x, player.y, &playerNew.x, &playerNew.y, &collisions);
-		if (collisions > 0) {
-			SpriteCollisionInfo ci = c[0];
-		
-			void* ptr = pd->sprite->getUserdata(ci.other);
+			movement = Vec2Normalize(movement);
+			const float movementSpeed = 4.0f;
+			movement = Vec2Scale(movement, movementSpeed);
+			pd->sprite->moveBy(g.Player.sprite, -movement.x, -movement.y);
+		}
 
-			//TODO make switch statement 
-			
-			if (IsItem(ptr)) {
-				SetItemCollected(pd, ptr);
-			} else if (IsEnemy(ptr)) {
-				// YOU DED!
-				pd->sprite->moveTo(g.Player.sprite, 0.0f, 0.0f);
+		// Light
+		// ---------------------------------------------------------
+		{
+			tDampedSpringMotionParams lightDamping = CalcDampedSpringMotionParams(1.0f / 50.0f, 0.5f, 1.0f);
+			float rawLightFill = fabsf( pd->system->getCrankChange() * 0.08f);
+			rawLightFill = max(32.0f / lightFullRadius, rawLightFill);
+			UpdateDampedSpringMotion(&g.light.radius01, &g.light.radiusVel, rawLightFill, lightDamping);
 
-				for (size_t i = 0; i < ITEM_COUNT; i++) {
-					ResetItem(pd, &g.items[i]);
+			int lightAreaSize = (int)(g.light.radius01 * lightFullRadius);
+
+			int x = 200 - lightAreaSize / 2;
+			int y = 120 - lightAreaSize / 2;
+			pd->graphics->pushContext(g.bitmaps.lightMask);
+				pd->graphics->setDrawOffset(0, 0);
+				pd->graphics->clear(kColorBlack);
+				pd->graphics->fillEllipse(x, y, lightAreaSize, lightAreaSize, 0.0f, 0.0f, kColorClear);
+			pd->graphics->popContext();
+		}
+		// Background Anim
+		// ---------------------------------------------------------
+		{
+			uint16_t frameCount = GetBitmapTableCount(g.bitmaps.background);
+			pd->sprite->setImage(g.sprites.background, pd->graphics->getTableBitmap(g.bitmaps.background, (g.frameCount / 4) % frameCount), kBitmapUnflipped);
+		}
+
+		// Items Anim
+		// ---------------------------------------------------------
+		{
+			_Bool allItemsCollected = 1;
+			for (size_t i = 0; i < ITEM_COUNT; i++) {
+				UpdateItem(pd, &g.items[i]);
+				allItemsCollected &= g.items[i].collected;
+			}
+
+			if (allItemsCollected) {
+				g.gameState = gsShowCutscene;
+				g.activeCutScene = csEnd;
+			}
+
+			for (size_t enemyIdx = 0; enemyIdx < arrLen(g.enemies); enemyIdx++) {
+				UpdateEnemy(pd, &g.enemies[enemyIdx]);
+			}
+		}
+
+		// check player item collisions
+		{
+			Vec2 player;
+			pd->sprite->getPosition(g.Player.sprite, &player.x, &player.y);
+			Vec2 playerNew;
+			int collisions = 0;
+			SpriteCollisionInfo* c = pd->sprite->checkCollisions(g.Player.sprite, player.x, player.y, &playerNew.x, &playerNew.y, &collisions);
+			if (collisions > 0) {
+				SpriteCollisionInfo ci = c[0];
+
+				void* ptr = pd->sprite->getUserdata(ci.other);
+
+				//TODO make switch statement 
+				if (IsItem(ptr)) {
+					SetItemCollected(pd, ptr);
+				}
+				else if (IsEnemy(ptr)) {
+					// YOU DED.
+					resetGame(pd);
 				}
 			}
 		}
 
-		for (size_t i = 0; i < ITEM_COUNT; i++) {
-			UpdateItem(pd, &g.items[i]);
+
+
+		
+		break;
 		}
 	}
 
-	{
-		for (size_t enemyIdx = 0; enemyIdx < arrLen(g.enemies); enemyIdx++) {
-			UpdateEnemy(pd, &g.enemies[enemyIdx]);
-		}
-	}
-
-
-	Vec2 cameraTarget = {0};
+	Vec2 cameraTarget = { 0 };
 	pd->sprite->getPosition(g.Player.sprite, &cameraTarget.x, &cameraTarget.y);
 	cameraTarget.x -= 200.0f;
 	cameraTarget.y -= 120.0f;
-	pd->graphics->setDrawOffset((int) -cameraTarget.x, (int) -cameraTarget.y);
+	pd->graphics->setDrawOffset((int)-cameraTarget.x, (int)-cameraTarget.y);
 	pd->sprite->updateAndDrawSprites();
 
+	pd->graphics->setDrawOffset(0, 0);
+	// Draw dialogue/cutscene text
+	if (g.showDialogueBox ) {
+		pd->graphics->setDrawMode(kDrawModeCopy);
+		pd->graphics->drawBitmap(g.bitmaps.dialogueBox, 0, 0, kBitmapUnflipped);
+	}
+	
+	if (g.currentDialogue != NULL) {
+		pd->graphics->setFont(g.font);
+		pd->graphics->setDrawMode(kDrawModeFillWhite);
+		pd->graphics->drawText(g.currentDialogue, strlen(g.currentDialogue), kUTF8Encoding, 20, 163);
+		pd->graphics->setDrawMode(kDrawModeCopy);
+	}
 
 	// debug info
-	const int showDebugInfo = 1;
+	const int showDebugInfo = 0;
 	if (showDebugInfo) {
 		const char* buildMsg = "BUILD " __TIME__;
 		pd->graphics->setDrawOffset(0, 0);
-		pd->graphics->fillRect(0, 230, 400, 10, kColorWhite);
+		pd->graphics->fillRect(0, 220, 400, 20, kColorWhite);
 		pd->graphics->setFont(g.font);
+		pd->graphics->drawText(buildMsg, strlen(buildMsg), kUTF8Encoding, 0, 230);
+
+		const char* playerPosStr;
+		Vec2 playerPos;
+		pd->sprite->getPosition(g.Player.sprite, &playerPos.x, &playerPos.y);
+		pd->system->formatString(&playerPosStr, "X %.0f Y %.0f", playerPos.x, playerPos.y);
+		pd->graphics->drawText(playerPosStr, strlen(playerPosStr), kUTF8Encoding, 0, 220);
+
 		pd->graphics->drawText(buildMsg, strlen(buildMsg), kUTF8Encoding, 0, 230);
 		pd->system->drawFPS(385, 230);
 	}
 
 	g.frameCount++;
+	g.frameCountSinceCutSceneStart++;
 
 	return 1;
 }
