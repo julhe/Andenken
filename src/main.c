@@ -18,7 +18,7 @@ static int update(void* userdata);
 static void init(PlaydateAPI* userdata);
 const char* fontpath = "/Asterix.pft";
 
-LCDFont* font = NULL;
+
 
 #ifdef _WINDLL
 __declspec(dllexport)
@@ -26,17 +26,12 @@ __declspec(dllexport)
 int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
 {
 	(void)arg; // arg is currently only used for event = kEventKeyPressed
-
 	if ( event == kEventInit )
 	{
-
 		// Note: If you set an update callback in the kEventInit handler, the system assumes the game is pure C and doesn't run any Lua code in the game
 		init(pd);
 		pd->system->setUpdateCallback(update, pd);
-
-	
 	}
-	
 	return 0;
 }
 
@@ -44,7 +39,9 @@ int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
 // ---------------------------------------------------------
 // .* Game Code *.
 // ---------------------------------------------------------
-// 
+
+// Core types and functions
+// ---------------------------------------------------------
 #define PI 3.141f
 
 #undef max 
@@ -52,6 +49,7 @@ int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
 #undef min
 #define min(a, b) ((a) > (b) ? (b) : (a))
 
+#define arrLen(staticArray) (sizeof(staticArray)/sizeof(staticArray[0]))
 
 typedef enum {
 	tGround,
@@ -66,7 +64,7 @@ typedef struct {
 	float x, y;
 } Vec2;
 
-
+// IMPORTANT: Hack allert! This function may break in futher releases of the Playdate SDK. See link below.
 // Source (big oof): https://devforum.play.date/t/c-api-get-number-of-bitmaps-in-lcdbitmaptable/9134/5
 static uint16_t GetBitmapTableCount(LCDBitmapTable* table) {
 	return *(uint16_t*)table;
@@ -104,12 +102,28 @@ LCDBitmap* ScaleBitmap(PlaydateAPI* pd, LCDBitmap* src, float scaleX, float scal
 	
 	return newBitmap;
 }
-float Vec2Length(Vec2 v) {
-	return sqrtf(v.x * v.x + v.y * v.y);
+
+// Checks if a pointer is an element of an array.
+// TODO: is size_t also the size of a memory adress on every platform?
+int IsPtrInArray(void* ptr, void* firstElement, void* lastElement) {
+	const size_t ptr_i	= (size_t) ptr;
+	const size_t first	= (size_t) firstElement;
+	const size_t last	= (size_t) lastElement;
+
+	return ptr_i >= first && ptr_i < last;
+}
+// Vector math
+// ---------------------------------------------------------
+float Vec2Dot(Vec2 a, Vec2 b) {
+	return a.x * b.x + a.y * b.y;
 }
 
-Vec2 Vec2Normalized(Vec2 v) {
-	float length = Vec2Length(v);
+float Vec2Length(Vec2 v) {
+	return sqrtf(Vec2Dot(v, v));
+}
+
+Vec2 Vec2Normalize(Vec2 v) {
+	const float length = Vec2Length(v);
 	if (length > 0.0f) {
 		return (Vec2) { v.x / length, v.y / length };
 	}
@@ -121,6 +135,13 @@ Vec2 Vec2Scale(Vec2 v, float s) {
 	return (Vec2){ v.x * s, v.y * s };
 }
 
+Vec2 Vec2Add(Vec2 a, Vec2 b) {
+	return (Vec2) { a.x + b.x, a.y + b.y };
+}
+
+Vec2 Vec2Sub(Vec2 a, Vec2 b) {
+	return (Vec2) { a.x - b.x, a.y - b.y };
+}
 
 
 //NOTE-Julian: stolen from raylib!
@@ -196,19 +217,17 @@ static LCDColor GetDithered(int x, int y, float value, LCDColor lowColor, LCDCol
 	return dither + value > 1.0f ? lowColor : highColor;
 }
 
-typedef enum {
-	udIsPlayer = 1,
-	udIsItem = 2,
-} SpriteUserData;
-
+// Item defs
+// ---------------------------------------------------------
 #define ITEM_COUNT 5
 typedef enum {
-	ItemCasette,
-	ItemGameBoy,
-	ItemPuzzle,
-	ItemSandwich,
-	ItemTeddy,
+	itCasette,
+	itGameBoy,
+	itPuzzle,
+	itSandwich,
+	itTeddy,
 } ItemType;
+
 
 typedef struct {
 	LCDSprite* spriteWorld;
@@ -218,14 +237,35 @@ typedef struct {
 	int collected;
 } Item;
 
+// Enemy defs
+// ---------------------------------------------------------
+#define ENEMY_TYPE_COUNT 2
 
+typedef enum {
+	etShear,
+	//etComputerHead TODO: not implemented yet
+} EmemyType;
 
+typedef struct {
+	int active;
+	EmemyType type;
+	LCDSprite* sprite;
+} Enemy;
 
+// Game Context
+// ---------------------------------------------------------
+
+const float lightFullRadius = 240.0f;
 static struct {
 	unsigned int frameCount;
 	struct {
 		LCDSprite* sprite;
 	}Player;
+
+	Item items[ITEM_COUNT];
+	Enemy enemies[8];
+
+	LCDFont* font;
 	struct {
 		LCDSprite* lightMask;
 		LCDSprite* background;
@@ -234,12 +274,13 @@ static struct {
 
 	struct {
 		LCDBitmapTable* player[9 /*8 directions + 1 idle*/];
-		LCDBitmap* light_base;
+		LCDBitmapTable* enemies[ENEMY_TYPE_COUNT];
 		LCDBitmapTable* background;
-	}bitmaps;
+		LCDBitmap* lightMask;		
+	} bitmaps;
 
 	struct {
-		float radius;
+		float radius01;
 		float radiusVel;
 	} light;
 
@@ -247,48 +288,48 @@ static struct {
 		LCDBitmap* bgBitmap;
 		LCDSprite* bg;
 	} ui;
+
 	struct {
 		float crankToLightMult;
-	}config;
+	} config;
 
-	Item items[ITEM_COUNT];
+
 }g;
 
+// Item functions
+// ---------------------------------------------------------
+void ResetItem(PlaydateAPI* pd, Item* item);
 void LoadAndInitializeItem(PlaydateAPI* pd, Item* item, int16_t index, float placementX, float placementY, const char* path) {
 	LoadBitmapTableFromFile(pd, &item->bitmap, path);
-	
-	// world
-	item->spriteWorld = pd->sprite->newSprite();
-	pd->sprite->addSprite(item->spriteWorld);
-	pd->sprite->setImage(item->spriteWorld, pd->graphics->getTableBitmap(item->bitmap, 0), kBitmapUnflipped);
-	pd->sprite->moveTo(item->spriteWorld, placementX, placementY);
-
-	// setup collision
-
-	pd->sprite->setCollideRect(item->spriteWorld, (PDRect) { .width = 64.0f, .height = 64.0f });
-	pd->sprite->collisionsEnabled(item->spriteWorld);
-
-	pd->sprite->setUserdata(item->spriteWorld, (void*) (size_t) (index + udIsItem));
-
-	// ui
-	// make downscaled version
+	// make downscaled version of sprite for UI
 	item->bitmapUi = ScaleBitmap(pd, pd->graphics->getTableBitmap(item->bitmap, 0), 0.5f, 0.5f);
+
+	// place and setup UI sprite
 	item->spriteUi = pd->sprite->newSprite();
-
-
 	pd->sprite->setImage(item->spriteUi, item->bitmapUi, kBitmapUnflipped);
 	pd->sprite->moveTo(item->spriteUi, 16.0f + 32.0f * (float)index, 16.0f);
 	pd->sprite->setIgnoresDrawOffset(item->spriteUi, 1);
-	pd->sprite->setZIndex(item->spriteUi, 1100);
+	pd->sprite->setZIndex(item->spriteUi, 2100);
 
-	//pd->sprite->addSprite(item->spriteUi);
+	// place and setup world Sprite
+	item->spriteWorld = pd->sprite->newSprite();
+	pd->sprite->setImage(item->spriteWorld, pd->graphics->getTableBitmap(item->bitmap, 0), kBitmapUnflipped);
+	pd->sprite->moveTo(item->spriteWorld, placementX, placementY);
 
+	// setup collision for world sprite 
+	pd->sprite->setCollideRect(item->spriteWorld, (PDRect) { .width = 64.0f, .height = 64.0f });
+	pd->sprite->collisionsEnabled(item->spriteWorld);
+
+	// make sprite accessable 
+	pd->sprite->setUserdata(item->spriteWorld, (void*)item);
+
+
+	ResetItem(pd, item);
 }
 
 void UpdateItem(PlaydateAPI* pd, Item* item) {
 	uint16_t animFrames = GetBitmapTableCount(item->bitmap);
 	pd->sprite->setImage(item->spriteWorld, pd->graphics->getTableBitmap(item->bitmap, (g.frameCount / 4) % animFrames), kBitmapUnflipped);
-
 }
 
 void SetItemCollected(PlaydateAPI* pd, Item* item) {
@@ -297,6 +338,95 @@ void SetItemCollected(PlaydateAPI* pd, Item* item) {
 	pd->sprite->addSprite(item->spriteUi);
 }
 
+void ResetItem(PlaydateAPI* pd, Item* item) {
+	// remove from world (in case they where placed before)
+	pd->sprite->removeSprite(item->spriteUi);
+	pd->sprite->removeSprite(item->spriteWorld);
+	item->collected = 0;
+
+	// add sprite to world.
+	pd->sprite->addSprite(item->spriteWorld);
+}
+
+int IsItem(void* itemPtr) {
+	return IsPtrInArray(itemPtr, &g.items[0], &g.items[ITEM_COUNT]);
+}
+
+// Enemy functions
+// ---------------------------------------------------------
+
+void DisableEnemy(PlaydateAPI* pd, Enemy* em) {
+	if (!em->active) {
+		return;
+	}
+	em->active = 0;
+	pd->sprite->removeSprite(em->sprite);
+	pd->sprite->freeSprite(em->sprite);
+}
+
+void EnableEnemy(PlaydateAPI* pd, Enemy* em, EmemyType type) {
+	if (em->active) {
+		return; 
+	}
+	em->active = 1;
+	em->type = type;
+
+	// setup sprite
+	em->sprite = pd->sprite->newSprite();
+	LCDBitmap* firstFrame = pd->graphics->getTableBitmap(g.bitmaps.enemies[em->type], 0);
+	if (em->type == etShear) {
+		pd->sprite->setZIndex(em->sprite, 1001);
+	}
+	pd->sprite->setImage(em->sprite, firstFrame, kBitmapUnflipped);
+	pd->sprite->addSprite(em->sprite);
+	pd->sprite->setCollideRect(em->sprite, (PDRect) {.x = 16.0f, .width = 32.0f, .height = 64.0f });
+	pd->sprite->collisionsEnabled(em->sprite);
+
+	pd->sprite->setUserdata(em->sprite, (void*) em);
+}
+
+void UpdateEnemy(PlaydateAPI* pd, Enemy* em) {
+	if (!em->active) {
+		return;
+	}
+
+	Vec2 pos;
+	pd->sprite->getPosition(em->sprite, &pos.x, &pos.y);
+	Vec2 playerPos;
+	pd->sprite->getPosition(g.Player.sprite, &playerPos.x, &playerPos.y);
+
+	switch (em->type)
+	{
+	case etShear: {
+		Vec2 vecToPlayer = Vec2Sub(playerPos, pos);
+		float distToPlayer = Vec2Length(vecToPlayer);
+		Vec2 dirToPlayer = Vec2Normalize(vecToPlayer);
+		int inRadius = distToPlayer < (g.light.radius01 * lightFullRadius * 0.25f);
+		if (!inRadius) {
+			pd->sprite->moveBy(em->sprite, dirToPlayer.x, dirToPlayer.y);
+		}
+
+		uint16_t animFrameCount = GetBitmapTableCount(g.bitmaps.enemies[em->type]);
+		LCDBitmap* currentFrame = pd->graphics->getTableBitmap(g.bitmaps.enemies[em->type], (g.frameCount / 4) % animFrameCount);
+		pd->sprite->setImage(em->sprite, currentFrame, kBitmapUnflipped);
+
+		break;
+	}
+	default:
+		break;
+	}
+
+
+}
+
+
+
+int IsEnemy(void* enemyPtr) {
+	return IsPtrInArray(enemyPtr, &g.enemies[0], &g.enemies[arrLen(g.enemies)]);
+}
+
+// Config reloading (obsolete?)
+// ---------------------------------------------------------
 static void reloadAssets(PlaydateAPI* pd) {
 	// load ini
 	char* content = LoadTextFile(pd, "config.ini");
@@ -317,9 +447,9 @@ static void init(PlaydateAPI* pd)
 	// ---------------------------------------------------------
 	{
 		const char* err;
-		font = pd->graphics->loadFont(fontpath, &err);
+		g.font = pd->graphics->loadFont(fontpath, &err);
 
-		if (font == NULL)
+		if (g.font == NULL)
 			pd->system->error("%s:%i Couldn't load font %s: %s", __FILE__, __LINE__, fontpath, err);
 	}
 
@@ -327,7 +457,7 @@ static void init(PlaydateAPI* pd)
 	pd->display->setRefreshRate(50.0f);
 
 
-	g.light.radius = .1f;
+	g.light.radius01 = .1f;
 	// Initialize sprites
 	// ---------------------------------------------------------
 	LoadBitmapTableFromFile(pd, &g.bitmaps.player[0], "player/runDownRight.gif");
@@ -351,9 +481,9 @@ static void init(PlaydateAPI* pd)
 	
 
 	// setup light area 
-	g.bitmaps.light_base = pd->graphics->newBitmap(screenWidth, screenHeight, kColorClear);
+	g.bitmaps.lightMask = pd->graphics->newBitmap(screenWidth, screenHeight, kColorClear);
 	g.sprites.lightMask = pd->sprite->newSprite();
-	pd->sprite->setImage(g.sprites.lightMask, g.bitmaps.light_base, kBitmapUnflipped);
+	pd->sprite->setImage(g.sprites.lightMask, g.bitmaps.lightMask, kBitmapUnflipped);
 
 	pd->sprite->addSprite(g.sprites.lightMask);
 	pd->sprite->moveTo(g.sprites.lightMask, 200.0f, 120.0f);
@@ -368,11 +498,11 @@ static void init(PlaydateAPI* pd)
 
 
 	// Items
-	LoadAndInitializeItem(pd, &g.items[ItemCasette],	ItemCasette,	0200.0f, 0500.0f, "items/itemCasette.gif");
-	LoadAndInitializeItem(pd, &g.items[ItemGameBoy],	ItemGameBoy,	0600.0f, 0100.0f, "items/itemGameBoy.gif");
-	LoadAndInitializeItem(pd, &g.items[ItemPuzzle],		ItemPuzzle,		1200.0f, 0900.0f, "items/itemPuzzle.gif");
-	LoadAndInitializeItem(pd, &g.items[ItemSandwich],	ItemSandwich,	0000.0f, 0000.0f, "items/itemSandwich.gif");
-	LoadAndInitializeItem(pd, &g.items[ItemTeddy],		ItemTeddy,		0900.0f, 0500.0f, "items/itemTeddy.gif");
+	LoadAndInitializeItem(pd, &g.items[itCasette],	itCasette,		0200.0f, 0500.0f, "items/itemCasette.gif");
+	LoadAndInitializeItem(pd, &g.items[itGameBoy],	itGameBoy,		0600.0f, 0100.0f, "items/itemGameBoy.gif");
+	LoadAndInitializeItem(pd, &g.items[itPuzzle],	itPuzzle,		1200.0f, 0900.0f, "items/itemPuzzle.gif");
+	LoadAndInitializeItem(pd, &g.items[itSandwich],	itSandwich,		0000.0f, 0000.0f, "items/itemSandwich.gif");
+	LoadAndInitializeItem(pd, &g.items[itTeddy],	itTeddy,		0900.0f, 0500.0f, "items/itemTeddy.gif");
 
 	//UI background
 	const int uiBarHeught = 32;
@@ -382,8 +512,12 @@ static void init(PlaydateAPI* pd)
 	pd->sprite->addSprite(g.ui.bg);
 	pd->sprite->moveTo(g.ui.bg, 200, uiBarHeught * 0.5f);
 	pd->sprite->setIgnoresDrawOffset(g.ui.bg, 1);
-	pd->sprite->setZIndex(g.ui.bg, 1001);
+	pd->sprite->setZIndex(g.ui.bg, 2001);
 
+	//Enemy bitmaps
+	LoadBitmapTableFromFile(pd, &g.bitmaps.enemies[etShear], "enemies/enemyShear.gif");
+
+	EnableEnemy(pd, &g.enemies[0], etShear);
 	reloadAssets(pd);
 }
 
@@ -426,7 +560,7 @@ static int update(void* userdata)
 			pd->graphics->getTableBitmap(g.bitmaps.player[animTableIndex], (g.frameCount / 4) % animTableCount),
 			kBitmapUnflipped);
 
-		movement = Vec2Normalized(movement);
+		movement = Vec2Normalize(movement);
 		const float movementSpeed = 4.0f;
 		movement = Vec2Scale(movement, movementSpeed);
 		pd->sprite->moveBy(g.Player.sprite, -movement.x, -movement.y);
@@ -437,15 +571,14 @@ static int update(void* userdata)
 	{
 		tDampedSpringMotionParams lightDamping = CalcDampedSpringMotionParams(1.0f / 50.0f, 0.25f, 1.0f);
 		float rawLightFill = fabsf( pd->system->getCrankChange() * 0.08f);
-		rawLightFill = max(32.0f / 240.0f, rawLightFill);
-		UpdateDampedSpringMotion(&g.light.radius, &g.light.radiusVel, rawLightFill, lightDamping);
+		rawLightFill = max(32.0f / lightFullRadius, rawLightFill);
+		UpdateDampedSpringMotion(&g.light.radius01, &g.light.radiusVel, rawLightFill, lightDamping);
 
-		const float maxSize = 240.0f;
-		int lightAreaSize = (int)(g.light.radius * maxSize);
+		int lightAreaSize = (int)(g.light.radius01 * lightFullRadius);
 
 		int x = 200 - lightAreaSize / 2;
 		int y = 120 - lightAreaSize / 2;
-		pd->graphics->pushContext(g.bitmaps.light_base);
+		pd->graphics->pushContext(g.bitmaps.lightMask);
 			pd->graphics->setDrawOffset(0, 0);
 			pd->graphics->clear(kColorBlack);
 			pd->graphics->fillEllipse(x, y, lightAreaSize, lightAreaSize, 0.0f, 0.0f, kColorClear);
@@ -461,28 +594,42 @@ static int update(void* userdata)
 	// Items Anim
 	// ---------------------------------------------------------
 	// check player item collisions
-
 	{
-		
-		float playerX, playerY;
-		pd->sprite->getPosition(g.Player.sprite, &playerX, &playerY);
-		float playerXnew, playerYnew;
+		Vec2 player;
+		pd->sprite->getPosition(g.Player.sprite, &player.x, &player.y);
+		Vec2 playerNew;
 		int collisions = 0;
-		SpriteCollisionInfo* c = pd->sprite->checkCollisions(g.Player.sprite, playerX, playerY, &playerXnew, &playerYnew, &collisions);
+		SpriteCollisionInfo* c = pd->sprite->checkCollisions(g.Player.sprite, player.x, player.y, &playerNew.x, &playerNew.y, &collisions);
 		if (collisions > 0) {
 			SpriteCollisionInfo ci = c[0];
-			size_t userData = (size_t) pd->sprite->getUserdata(ci.other);
-			size_t itemId = userData - udIsItem;
-			if (itemId < ITEM_COUNT) {
-				SetItemCollected(pd, &g.items[itemId]);
+		
+			void* ptr = pd->sprite->getUserdata(ci.other);
+
+			//TODO make switch statement 
+			
+			if (IsItem(ptr)) {
+				SetItemCollected(pd, ptr);
+			} else if (IsEnemy(ptr)) {
+				// YOU DED!
+				pd->sprite->moveTo(g.Player.sprite, 0.0f, 0.0f);
+
+				for (size_t i = 0; i < ITEM_COUNT; i++) {
+					ResetItem(pd, &g.items[i]);
+				}
 			}
 		}
 
 		for (size_t i = 0; i < ITEM_COUNT; i++) {
 			UpdateItem(pd, &g.items[i]);
 		}
-
 	}
+
+	{
+		for (size_t enemyIdx = 0; enemyIdx < arrLen(g.enemies); enemyIdx++) {
+			UpdateEnemy(pd, &g.enemies[enemyIdx]);
+		}
+	}
+
 
 	Vec2 cameraTarget = {0};
 	pd->sprite->getPosition(g.Player.sprite, &cameraTarget.x, &cameraTarget.y);
@@ -491,7 +638,18 @@ static int update(void* userdata)
 	pd->graphics->setDrawOffset((int) -cameraTarget.x, (int) -cameraTarget.y);
 	pd->sprite->updateAndDrawSprites();
 
-	pd->system->drawFPS(0, 0);
+
+	// debug info
+	const int showDebugInfo = 1;
+	if (showDebugInfo) {
+		const char* buildMsg = "BUILD " __TIME__;
+		pd->graphics->setDrawOffset(0, 0);
+		pd->graphics->fillRect(0, 230, 400, 10, kColorWhite);
+		pd->graphics->setFont(g.font);
+		pd->graphics->drawText(buildMsg, strlen(buildMsg), kUTF8Encoding, 0, 230);
+		pd->system->drawFPS(385, 230);
+	}
+
 	g.frameCount++;
 
 	return 1;
